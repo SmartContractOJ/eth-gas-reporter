@@ -1,17 +1,23 @@
 const mocha = require("mocha");
-const inherits = require("util").inherits;
 const Base = mocha.reporters.Base;
-const color = Base.color;
-const log = console.log;
 const utils = require("./lib/utils");
 const Config = require("./lib/config");
 const TransactionWatcher = require("./lib/transactionWatcher");
 const GasTable = require("./lib/gasTable");
 const SyncRequest = require("./lib/syncRequest");
 const mochaStats = require("./lib/mochaStats");
+const constants = require("mocha/lib/runner").constants;
+const EVENT_RUN_BEGIN = constants.EVENT_RUN_BEGIN;
+const EVENT_RUN_END = constants.EVENT_RUN_END;
+const EVENT_HOOK_END = constants.EVENT_HOOK_END;
+const EVENT_TEST_BEGIN = constants.EVENT_TEST_BEGIN;
+const EVENT_TEST_END = constants.EVENT_TEST_END;
+const EVENT_TEST_PENDING = constants.EVENT_TEST_PENDING;
+const EVENT_TEST_PASS = constants.EVENT_TEST_PASS;
+const EVENT_TEST_FAIL = constants.EVENT_TEST_FAIL;
 
 /**
- * Based on the Mocha 'Spec' reporter. Watches an Ethereum test suite run
+ * Based on the Mocha 'JSON' reporter. Watches an Ethereum test suite run
  * and collects data about method & deployments gas usage. Mocha executes the hooks
  * in this reporter synchronously so any client calls here should be executed
  * via low-level RPC interface using sync-request. (see /lib/syncRequest)
@@ -22,7 +28,7 @@ const mochaStats = require("./lib/mochaStats");
  * @param {Object} options reporter.options (see README example usage)
  */
 function Gas(runner, options) {
-  // Spec reporter
+  // JSON reporter
   Base.call(this, runner, options);
 
   // Initialize stats for Mocha 6+ epilogue
@@ -32,11 +38,10 @@ function Gas(runner, options) {
   }
 
   const self = this;
-
-  let indents = 0;
-  let n = 0;
-  let failed = false;
-  let indent = () => Array(indents).join("  ");
+  const tests = [];
+  const pending = [];
+  const failures = [];
+  const passes = [];
 
   // Gas reporter setup
   const config = new Config(options.reporterOptions);
@@ -54,102 +59,121 @@ function Gas(runner, options) {
 
   // ------------------------------------  Runners -------------------------------------------------
 
-  runner.on("start", () => {
+  runner.on(EVENT_RUN_BEGIN, () => {
     watch.data.initialize(config);
   });
 
-  runner.on("suite", suite => {
-    ++indents;
-    log(color("suite", "%s%s"), indent(), suite.title);
+  runner.on(EVENT_TEST_END, function(test) {
+    tests.push(test);
   });
 
-  runner.on("suite end", () => {
-    --indents;
-    if (indents === 1) {
-      log();
-    }
+  runner.on(EVENT_TEST_PENDING, test => {
+    pending.push(test);
   });
 
-  runner.on("pending", test => {
-    let fmt = indent() + color("pending", "  - %s");
-    log(fmt, test.title);
-  });
-
-  runner.on("test", () => {
+  runner.on(EVENT_TEST_BEGIN, () => {
     if (!config.provider) {
       watch.beforeStartBlock = sync.blockNumber();
     }
     watch.data.resetAddressCache();
   });
 
-  runner.on("hook end", hook => {
+  runner.on(EVENT_HOOK_END, hook => {
     if (hook.title.includes("before each") && !config.provider) {
       watch.itStartBlock = sync.blockNumber() + 1;
     }
   });
 
-  runner.on("pass", test => {
-    let fmt;
-    let fmtArgs;
-    let gasUsedString;
-    let consumptionString;
-    let timeSpentString = color(test.speed, "%dms");
-    let gasUsed;
-
-    if (!config.provider) {
-      gasUsed = watch.blocks();
-    }
-
-    if (gasUsed) {
-      gasUsedString = color("checkmark", "%d gas");
-
-      if (config.showTimeSpent) {
-        consumptionString = " (" + timeSpentString + ", " + gasUsedString + ")";
-        fmtArgs = [test.title, test.duration, gasUsed];
-      } else {
-        consumptionString = " (" + gasUsedString + ")";
-        fmtArgs = [test.title, gasUsed];
-      }
-
-      fmt =
-        indent() +
-        color("checkmark", "  " + Base.symbols.ok) +
-        color("pass", " %s") +
-        consumptionString;
-    } else {
-      if (config.showTimeSpent) {
-        consumptionString = " (" + timeSpentString + ")";
-        fmtArgs = [test.title, test.duration];
-      } else {
-        consumptionString = "";
-        fmtArgs = [test.title];
-      }
-
-      fmt =
-        indent() +
-        color("checkmark", "  " + Base.symbols.ok) +
-        color("pass", " %s") +
-        consumptionString;
-    }
-    log.apply(null, [fmt, ...fmtArgs]);
+  runner.on(EVENT_TEST_PASS, test => {
+    passes.push(test);
   });
 
-  runner.on("fail", test => {
-    failed = true;
-    let fmt = indent() + color("fail", "  %d) %s");
-    log();
-    log(fmt, ++n, test.title);
+  runner.on(EVENT_TEST_FAIL, test => {
+    failures.push(test);
   });
 
-  runner.on("end", () => {
-    table.generate(watch.data);
+  runner.on(EVENT_RUN_END, () => {
+    const report = table.saveCodeChecksData(watch.data);
+
+    const obj = {
+      stats: self.stats,
+      tests: tests.map(clean),
+      pending: pending.map(clean),
+      failures: failures.map(clean),
+      passes: passes.map(clean),
+      gasReport: report
+    };
+
+    runner.testResults = obj;
+    const json = JSON.stringify(obj, null, 2);
+    process.stdout.write(json);
+
     self.epilogue();
   });
 }
 
 /**
- * Inherit from `Base.prototype`.
+ * Return a plain-object representation of `test`
+ * free of cyclic properties etc.
+ *
+ * @private
+ * @param {Object} test
+ * @return {Object}
  */
-inherits(Gas, Base);
+function clean(test) {
+  var err = test.err || {};
+  if (err instanceof Error) {
+    err = errorJSON(err);
+  }
+
+  return {
+    title: test.title,
+    fullTitle: test.fullTitle(),
+    file: test.file,
+    duration: test.duration,
+    currentRetry: test.currentRetry(),
+    speed: test.speed,
+    err: cleanCycles(err)
+  };
+}
+
+/**
+ * Replaces any circular references inside `obj` with '[object Object]'
+ *
+ * @private
+ * @param {Object} obj
+ * @return {Object}
+ */
+function cleanCycles(obj) {
+  var cache = [];
+  return JSON.parse(
+    JSON.stringify(obj, function(key, value) {
+      if (typeof value === "object" && value !== null) {
+        if (cache.indexOf(value) !== -1) {
+          // Instead of going in a circle, we'll print [object Object]
+          return "" + value;
+        }
+        cache.push(value);
+      }
+
+      return value;
+    })
+  );
+}
+
+/**
+ * Transform an Error object into a JSON object.
+ *
+ * @private
+ * @param {Error} err
+ * @return {Object}
+ */
+function errorJSON(err) {
+  var res = {};
+  Object.getOwnPropertyNames(err).forEach(function(key) {
+    res[key] = err[key];
+  }, err);
+  return res;
+}
 
 module.exports = Gas;
