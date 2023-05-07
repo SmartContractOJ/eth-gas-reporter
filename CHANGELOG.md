@@ -1,5 +1,9 @@
 ## Changelog: eth-gas-reporter
 
+# 0.3.0 / 2023-05-07
+
+- 基于 mocha JSON reporter 返回报告数据
+
 # 0.2.23 / 2021-11-26
 
 - Add notes to README about missing price data & remote data fetching race condition
